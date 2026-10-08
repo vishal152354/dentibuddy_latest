@@ -1,8 +1,9 @@
 import { Link, useLocation, useNavigate } from "@tanstack/react-router";
-import { Home, Calendar, MessageCircle, Siren, User, Stethoscope, Lightbulb, ShieldCheck, ClipboardList, History, ScanFace } from "lucide-react";
+import { Home, Calendar, MessageCircle, Siren, User, Stethoscope, Lightbulb, ShieldCheck, ClipboardList, History, ScanFace, Trophy } from "lucide-react";
 import { ReactNode, useEffect } from "react";
 import { useAuth } from "@/context/auth-context";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { NotificationBell } from "@/components/notification-bell";
 
 const patientMobileTabs = [
   { to: "/home", label: "Home", icon: Home },
@@ -18,6 +19,7 @@ const patientDesktopNav = [
   { to: "/appointments", label: "Visits", icon: Calendar },
   { to: "/history", label: "History", icon: History },
   { to: "/teeth-check", label: "Teeth Check", icon: ScanFace },
+  { to: "/achievements", label: "Achievements", icon: Trophy },
   { to: "/chatbot", label: "Buddy AI", icon: MessageCircle },
   { to: "/emergency", label: "Emergency", icon: Siren },
   { to: "/tips", label: "Tips", icon: Lightbulb },
@@ -82,7 +84,7 @@ export function MobileShell({ children, hideTabs = false }: { children: ReactNod
       {/* ── DESKTOP: sticky top nav ── */}
       <header className="hidden lg:block sticky top-0 z-50 border-b border-border bg-background/95 backdrop-blur-md">
         <div className="max-w-screen-xl mx-auto px-6 h-16 flex items-center gap-2">
-          <Link to="/home" className="flex items-center gap-2.5 shrink-0 mr-6">
+          <Link to="/home" className="flex items-center gap-2.5 shrink-0 mr-2 xl:mr-6">
             <div className="h-9 w-9 rounded-xl bg-gradient-to-br from-primary to-primary-glow flex items-center justify-center text-white text-lg shadow-[var(--shadow-soft)]">
               🦷
             </div>
@@ -100,7 +102,7 @@ export function MobileShell({ children, hideTabs = false }: { children: ReactNod
             </span>
           )}
 
-          <nav className="flex items-center gap-0.5 flex-1">
+          <nav className="flex items-center gap-0.5 flex-1 min-w-0">
             {desktopNav.map((item) => {
               const active =
                 item.to === "/home" || item.to === "/doctor"
@@ -112,7 +114,7 @@ export function MobileShell({ children, hideTabs = false }: { children: ReactNod
                 <Link
                   key={item.to}
                   to={item.to}
-                  className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-sm font-medium transition-colors ${
+                  className={`flex items-center gap-1.5 xl:gap-2 px-2 xl:px-3.5 py-2 rounded-xl text-sm font-medium whitespace-nowrap transition-colors ${
                     isEmergency
                       ? active
                         ? "bg-coral/15 text-coral"
@@ -122,18 +124,22 @@ export function MobileShell({ children, hideTabs = false }: { children: ReactNod
                         : "text-muted-foreground hover:text-foreground hover:bg-accent"
                   }`}
                 >
-                  <Icon className={`h-4 w-4 shrink-0 ${active ? "stroke-[2.5]" : ""}`} />
+                  {/* Icons are dropped between lg and xl so every label still fits */}
+                  <Icon className={`hidden xl:block h-4 w-4 shrink-0 ${active ? "stroke-[2.5]" : ""}`} />
                   {item.label}
                 </Link>
               );
             })}
           </nav>
 
-          <ThemeToggle className="ml-auto mr-1" />
+          <div className="ml-auto mr-1 flex items-center gap-1 shrink-0">
+            <NotificationBell />
+            <ThemeToggle />
+          </div>
 
           <Link
             to="/profile"
-            className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-sm font-medium transition-colors ${
+            className={`flex items-center gap-2 px-2 xl:px-3.5 py-2 rounded-xl text-sm font-medium transition-colors shrink-0 ${
               loc.pathname.startsWith("/profile")
                 ? "bg-primary/10 text-primary"
                 : "text-muted-foreground hover:text-foreground hover:bg-accent"
@@ -142,7 +148,7 @@ export function MobileShell({ children, hideTabs = false }: { children: ReactNod
             <div className="h-7 w-7 rounded-full bg-gradient-to-br from-primary to-primary-glow flex items-center justify-center shadow-[var(--shadow-soft)]">
               <User className="h-3.5 w-3.5 text-white" />
             </div>
-            <span>Profile</span>
+            <span className="hidden xl:inline">Profile</span>
           </Link>
         </div>
       </header>
@@ -163,6 +169,7 @@ export function MobileShell({ children, hideTabs = false }: { children: ReactNod
             {role === 'doctor' && (
               <span className="text-xs font-semibold uppercase tracking-wider bg-mint text-mint-foreground px-2.5 py-1 rounded-full">Doctor</span>
             )}
+            <NotificationBell />
             <ThemeToggle />
           </div>
         </div>

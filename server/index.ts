@@ -59,6 +59,7 @@ const AppointmentSchema = new mongoose.Schema(
     reason: { type: String, default: '' },
     status: { type: String, enum: ['pending', 'confirmed', 'cancelled', 'completed'], default: 'pending' },
     is_emergency: { type: Boolean, default: false },
+    reminder_sent_at: { type: Date, default: null }, // set once the 15-minute reminder has gone out
   },
   { timestamps: true }
 );
@@ -380,7 +381,8 @@ app.post('/api/children', requireAuth, async (req, res) => {
 
 app.delete('/api/children/:id', requireAuth, async (req, res) => {
   try {
-    await Child.findOneAndDelete({ _id: req.params.id, parent_id: (req as any).userId });
+    const deleted = await Child.findOneAndDelete({ _id: req.params.id, parent_id: (req as any).userId });
+    if (deleted) await HabitLog.deleteMany({ child_id: deleted._id });
     res.json({ success: true });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
@@ -979,6 +981,245 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+// ── VISIT REMINDERS & NOTIFICATIONS ───────────────────────────────────────────
+// Appointments store a local date ("2026-10-09") and time ("10:00") with no timezone,
+// so they are interpreted in APP_TIMEZONE. A scheduler notifies the parent and the
+// doctor REMINDER_MINUTES before each pending/confirmed visit.
+
+const APP_TIMEZONE = process.env.APP_TIMEZONE || 'Asia/Kolkata';
+const REMINDER_MINUTES = 15;
+
+const NotificationSchema = new mongoose.Schema(
+  {
+    user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    type: { type: String, default: 'appointment_reminder' },
+    title: { type: String, required: true },
+    body: { type: String, default: '' },
+    link: { type: String, default: null },
+    appointment_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Appointment', default: null },
+    read_at: { type: Date, default: null },
+  },
+  { timestamps: true }
+);
+NotificationSchema.index({ createdAt: 1 }, { expireAfterSeconds: 30 * 86400 });
+const Notification = (mongoose.models['Notification'] as mongoose.Model<any>) || mongoose.model('Notification', NotificationSchema);
+
+function zonedParts(utcMs: number, tz: string) {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).formatToParts(new Date(utcMs)).map((p) => [p.type, p.value])
+  );
+  return parts as Record<'year' | 'month' | 'day' | 'hour' | 'minute' | 'second', string>;
+}
+
+/** "2026-10-09" + "10:00" in `tz` → epoch ms */
+function zonedToUtcMs(date: string, time: string, tz: string) {
+  const [y, mo, d] = date.split('-').map(Number);
+  const [h, mi] = time.split(':').map(Number);
+  const guess = Date.UTC(y, mo - 1, d, h, mi);
+  const p = zonedParts(guess, tz);
+  const offset = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - guess;
+  return guess - offset;
+}
+
+function zonedDate(utcMs: number, tz: string) {
+  const p = zonedParts(utcMs, tz);
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
+function formatTime12(time: string) {
+  const [h, m] = time.split(':').map(Number);
+  return `${((h + 11) % 12) + 1}:${String(m).padStart(2, '0')} ${h < 12 ? 'AM' : 'PM'}`;
+}
+
+async function sendDueReminders() {
+  if (mongoose.connection.readyState !== 1) return;
+  const now = Date.now();
+  // Today and tomorrow cover a visit just after midnight whose reminder falls before it
+  const dates = [zonedDate(now, APP_TIMEZONE), zonedDate(now + 86400_000, APP_TIMEZONE)];
+  const candidates = await Appointment.find({
+    appointment_date: { $in: dates },
+    status: { $in: ['pending', 'confirmed'] },
+    reminder_sent_at: null,
+  }).select('_id appointment_date appointment_time').lean();
+
+  for (const c of candidates as any[]) {
+    const startMs = zonedToUtcMs(c.appointment_date, c.appointment_time, APP_TIMEZONE);
+    if (now < startMs - REMINDER_MINUTES * 60_000 || now >= startMs) continue;
+
+    // Claim atomically so a reminder is sent once even with several server instances
+    const appt: any = await Appointment.findOneAndUpdate(
+      { _id: c._id, reminder_sent_at: null },
+      { reminder_sent_at: new Date() },
+      { new: true }
+    ).populate('child_id', 'name').populate('dentist_id', 'name clinic_name user_id').populate('parent_id', 'full_name');
+    if (!appt) continue;
+
+    const mins = Math.max(1, Math.round((startMs - now) / 60_000));
+    const when = formatTime12(appt.appointment_time);
+    const child = appt.child_id?.name ?? 'Your child';
+    const dentist = appt.dentist_id;
+    const docs: any[] = [{
+      user_id: appt.parent_id?._id ?? appt.parent_id,
+      title: `Dental visit in ${mins} minutes`,
+      body: `${child}'s appointment with ${dentist?.name ?? 'the dentist'}${dentist?.clinic_name ? ` at ${dentist.clinic_name}` : ''} starts at ${when}.`,
+      link: '/appointments',
+      appointment_id: appt._id,
+    }];
+    if (dentist?.user_id) {
+      docs.push({
+        user_id: dentist.user_id,
+        title: `Patient visit in ${mins} minutes`,
+        body: `${child}${appt.parent_id?.full_name ? ` (parent: ${appt.parent_id.full_name})` : ''} at ${when}${appt.reason ? ` — ${appt.reason}` : ''}.`,
+        link: '/doctor/appointments',
+        appointment_id: appt._id,
+      });
+    }
+    await Notification.insertMany(docs);
+    console.log(`🔔  Reminder sent for appointment ${appt._id} (${appt.appointment_date} ${appt.appointment_time})`);
+  }
+}
+setInterval(() => { sendDueReminders().catch((err) => console.error('Reminder job failed:', err.message)); }, 30_000).unref();
+
+function fmtNotification(n: any) {
+  return {
+    id: n._id.toString(), type: n.type, title: n.title, body: n.body, link: n.link,
+    read: !!n.read_at, created_at: n.createdAt,
+  };
+}
+
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).userId;
+    const [items, unread] = await Promise.all([
+      Notification.find({ user_id: userId }).sort({ createdAt: -1 }).limit(20),
+      Notification.countDocuments({ user_id: userId, read_at: null }),
+    ]);
+    res.json({ unread, items: items.map(fmtNotification) });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/notifications/read-all', requireAuth, async (req, res) => {
+  try {
+    await Notification.updateMany({ user_id: (req as any).userId, read_at: null }, { read_at: new Date() });
+    res.json({ success: true });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/notifications/:id/read', requireAuth, async (req, res) => {
+  try {
+    await Notification.updateOne({ _id: req.params.id, user_id: (req as any).userId }, { read_at: new Date() });
+    res.json({ success: true });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ── HABITS & STREAKS ──────────────────────────────────────────────────────────
+// One check-in per child per day (enforced by a unique index). The day is decided by the
+// server in APP_TIMEZONE, so a parent can't backdate or repeat a day by changing their clock.
+
+const HABIT_IDS = ['brush', 'paste', 'floss', 'water', 'snack', 'night'];
+const STREAK_MIN_HABITS = 4; // a day counts towards the streak when at least this many habits were done
+
+const HabitLogSchema = new mongoose.Schema(
+  {
+    parent_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    child_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Child', required: true },
+    date: { type: String, required: true }, // YYYY-MM-DD in APP_TIMEZONE
+    habits: { type: [String], default: [] },
+  },
+  { timestamps: true }
+);
+HabitLogSchema.index({ child_id: 1, date: 1 }, { unique: true });
+const HabitLog = (mongoose.models['HabitLog'] as mongoose.Model<any>) || mongoose.model('HabitLog', HabitLogSchema);
+
+const BADGES = [
+  { id: 'first', title: 'First check-in', detail: 'Logged habits for the first time', earned: (s: any) => s.total_days >= 1 },
+  { id: 'streak3', title: '3-day streak', detail: 'Three good days in a row', earned: (s: any) => s.longest >= 3 },
+  { id: 'streak7', title: 'One week', detail: 'Seven good days in a row', earned: (s: any) => s.longest >= 7 },
+  { id: 'perfect5', title: 'Five perfect days', detail: 'All six habits on five days', earned: (s: any) => s.perfect_days >= 5 },
+  { id: 'streak14', title: 'Two weeks', detail: 'Fourteen good days in a row', earned: (s: any) => s.longest >= 14 },
+  { id: 'streak30', title: 'Habit hero', detail: 'Thirty good days in a row', earned: (s: any) => s.longest >= 30 },
+];
+
+const addDays = (date: string, n: number) => {
+  const [y, m, d] = date.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
+};
+
+function streakSummary(logs: { date: string; habits: string[] }[], today: string) {
+  const qualifies = new Map(logs.map((l) => [l.date, l.habits.length >= STREAK_MIN_HABITS]));
+
+  // Current streak: an un-logged today doesn't break it yet, so start from yesterday in that case
+  let current = 0;
+  let day = qualifies.has(today) ? today : addDays(today, -1);
+  while (qualifies.get(day)) { current++; day = addDays(day, -1); }
+
+  let longest = 0, run = 0, prev: string | null = null;
+  for (const l of [...logs].sort((a, b) => a.date.localeCompare(b.date))) {
+    const ok = l.habits.length >= STREAK_MIN_HABITS;
+    run = ok ? (prev && addDays(prev, 1) === l.date ? run + 1 : 1) : 0;
+    prev = ok ? l.date : null;
+    longest = Math.max(longest, run);
+  }
+
+  const summary = {
+    current, longest,
+    total_days: logs.length,
+    perfect_days: logs.filter((l) => l.habits.length === HABIT_IDS.length).length,
+  };
+  return { ...summary, badges: BADGES.map((b) => ({ id: b.id, title: b.title, detail: b.detail, earned: b.earned(summary) })) };
+}
+
+app.get('/api/habits', requireAuth, async (req, res) => {
+  try {
+    const parentId = (req as any).userId;
+    const today = zonedDate(Date.now(), APP_TIMEZONE);
+    const children = await Child.find({ parent_id: parentId }).sort({ createdAt: 1 });
+    const logs = await HabitLog.find({ parent_id: parentId }).select('child_id date habits createdAt').lean();
+
+    res.json({
+      today,
+      min_habits: STREAK_MIN_HABITS,
+      habit_ids: HABIT_IDS,
+      children: children.map((c: any) => {
+        const mine = (logs as any[]).filter((l) => l.child_id.toString() === c._id.toString());
+        const byDate = new Map(mine.map((l) => [l.date, l]));
+        const todayLog = byDate.get(today);
+        return {
+          child: { id: c._id.toString(), name: c.name },
+          today: todayLog ? { habits: todayLog.habits, logged_at: todayLog.createdAt } : null,
+          ...streakSummary(mine, today),
+          last14: Array.from({ length: 14 }, (_, i) => {
+            const date = addDays(today, i - 13);
+            const l = byDate.get(date);
+            return { date, count: l ? l.habits.length : null };
+          }),
+        };
+      }),
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/habits/log', requireAuth, async (req, res) => {
+  const { child_id, habits } = req.body ?? {};
+  if (!child_id) { res.status(400).json({ error: 'child_id is required' }); return; }
+  const clean = [...new Set((Array.isArray(habits) ? habits : []).filter((h: any) => HABIT_IDS.includes(h)))];
+  // A day can only be saved once, so an empty save would lock the day by accident
+  if (!clean.length) { res.status(400).json({ error: 'Tick at least one habit before saving' }); return; }
+  try {
+    const child = await Child.findOne({ _id: child_id, parent_id: (req as any).userId }).catch(() => null);
+    if (!child) { res.status(404).json({ error: 'Child not found' }); return; }
+    const today = zonedDate(Date.now(), APP_TIMEZONE);
+    const log = await HabitLog.create({ parent_id: (req as any).userId, child_id, date: today, habits: clean });
+    res.status(201).json({ date: log.date, habits: log.habits, logged_at: log.createdAt });
+  } catch (err: any) {
+    if (err?.code === 11000) { res.status(409).json({ error: `Today's habits for this child are already saved. You can log again tomorrow.` }); return; }
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── TEETH PHOTO CHECK ─────────────────────────────────────────────────────────
 // Photo → "Good/Bad Teeth" image classifier (steven123/Check_GoodBad_Teeth, converted to 8-bit ONNX
 // by scripts/convert_teeth_model.py and committed under server/models/) + parent-reported red-flag symptoms → normal / abnormal / emergency.
@@ -1001,14 +1242,14 @@ const TeethCheckSchema = new mongoose.Schema(
 const TeethCheck = (mongoose.models['TeethCheck'] as mongoose.Model<any>) || mongoose.model('TeethCheck', TeethCheckSchema);
 
 // Symptoms are decided by rules, not the model: a photo cannot show swelling, fever or an injury's severity
-const SYMPTOMS: Record<string, { label: string; level: 'emergency' | 'abnormal' }> = {
-  swelling:    { label: 'Swelling of the face, cheek or gums', level: 'emergency' },
-  injury:      { label: 'Tooth knocked out, broken or pushed in after a fall or hit', level: 'emergency' },
-  bleeding:    { label: "Bleeding that won't stop after 10 minutes of pressure", level: 'emergency' },
-  fever:       { label: 'Fever together with tooth or mouth pain', level: 'emergency' },
-  severe_pain: { label: "Pain that keeps the child awake or isn't helped by painkillers", level: 'abnormal' },
-  pain:        { label: 'Toothache or sensitivity to hot, cold or sweet', level: 'abnormal' },
-  sores:       { label: 'Mouth sores or ulcers lasting more than 2 weeks', level: 'abnormal' },
+const SYMPTOMS: Record<string, { label: string; short: string; level: 'emergency' | 'abnormal' }> = {
+  swelling:    { short: 'Swelling',      label: 'Swelling of the face, cheek or gums', level: 'emergency' },
+  injury:      { short: 'Injury',        label: 'Tooth knocked out, broken or pushed in after a fall or hit', level: 'emergency' },
+  bleeding:    { short: 'Bleeding',      label: "Bleeding that won't stop after 10 minutes of pressure", level: 'emergency' },
+  fever:       { short: 'Fever + pain',  label: 'Fever together with tooth or mouth pain', level: 'emergency' },
+  severe_pain: { short: 'Severe pain',   label: "Pain that keeps the child awake or isn't helped by painkillers", level: 'abnormal' },
+  pain:        { short: 'Toothache',     label: 'Toothache or sensitivity to hot, cold or sweet', level: 'abnormal' },
+  sores:       { short: 'Mouth sores',   label: 'Mouth sores or ulcers lasting more than 2 weeks', level: 'abnormal' },
 };
 
 // Below this the model is close to a coin-flip, so the parent is asked for a clearer photo
