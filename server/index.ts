@@ -139,7 +139,129 @@ function requireRole(...roles: string[]) {
 // ── App setup ────────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
-app.use(express.json());
+// Teeth photos are sent as base64 and need a larger body limit than every other route
+const TEETH_CHECK_PATH = '/api/teeth-check';
+const defaultJson = express.json();
+const largeJson = express.json({ limit: '6mb' });
+app.use((req, res, next) => (req.path === TEETH_CHECK_PATH ? largeJson : defaultJson)(req, res, next));
+
+// ── METRICS (persisted in MongoDB, auto-expired by a TTL index) ────────────────
+interface ApiSample { t: number; method: string; route: string; status: number; ms: number }
+interface WebSample { t: number; kind: 'page_load' | 'navigation' | 'api'; page: string; ms: number; ttfb?: number; fcp?: number; dcl?: number; status?: number }
+
+const METRICS_RETENTION_DAYS = Math.max(1, Number(process.env.METRICS_RETENTION_DAYS) || 30);
+const metricsTtl = { expireAfterSeconds: METRICS_RETENTION_DAYS * 86400 };
+
+const ApiMetricSchema = new mongoose.Schema(
+  { t: { type: Date, required: true }, method: String, route: String, status: Number, ms: Number },
+  { versionKey: false, collection: 'api_metrics' }
+);
+ApiMetricSchema.index({ t: 1 }, metricsTtl);
+
+const WebMetricSchema = new mongoose.Schema(
+  { t: { type: Date, required: true }, kind: String, page: String, ms: Number, ttfb: Number, fcp: Number, dcl: Number, status: Number },
+  { versionKey: false, collection: 'web_metrics' }
+);
+WebMetricSchema.index({ t: 1 }, metricsTtl);
+
+const ApiMetric = (mongoose.models['ApiMetric'] as mongoose.Model<any>) || mongoose.model('ApiMetric', ApiMetricSchema);
+const WebMetric = (mongoose.models['WebMetric'] as mongoose.Model<any>) || mongoose.model('WebMetric', WebMetricSchema);
+
+// Samples are buffered and written in batches so recording a metric never adds a DB write to the request path
+const MAX_PENDING = 10000;
+let pendingApi: ApiSample[] = [];
+let pendingWeb: WebSample[] = [];
+const serverStartedAt = Date.now();
+
+function pushCapped<T>(arr: T[], item: T, cap: number) {
+  arr.push(item);
+  if (arr.length > cap) arr.splice(0, arr.length - cap);
+}
+
+async function flushMetrics() {
+  if (mongoose.connection.readyState !== 1) return; // keep buffering until the DB is up
+  const api = pendingApi, web = pendingWeb;
+  pendingApi = []; pendingWeb = [];
+  const toDocs = (list: any[]) => list.map((s) => ({ ...s, t: new Date(s.t) }));
+  try {
+    await Promise.all([
+      api.length ? ApiMetric.insertMany(toDocs(api), { ordered: false }) : null,
+      web.length ? WebMetric.insertMany(toDocs(web), { ordered: false }) : null,
+    ]);
+  } catch (err: any) {
+    console.error('Failed to persist metrics:', err.message);
+    pendingApi = [...api, ...pendingApi].slice(-MAX_PENDING);
+    pendingWeb = [...web, ...pendingWeb].slice(-MAX_PENDING);
+  }
+}
+setInterval(flushMetrics, 2000).unref();
+
+for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  process.once(sig, () => { flushMetrics().finally(() => process.exit(0)); });
+}
+
+/** Persisted samples since `since`, plus anything still waiting to be flushed. */
+async function loadSamples(since: number): Promise<{ api: ApiSample[]; web: WebSample[] }> {
+  const toSample = (d: any) => ({ ...d, _id: undefined, t: new Date(d.t).getTime() });
+  const [api, web] = await Promise.all([
+    ApiMetric.find({ t: { $gte: new Date(since) } }, { _id: 0 }).sort({ t: 1 }).lean(),
+    WebMetric.find({ t: { $gte: new Date(since) } }, { _id: 0 }).sort({ t: 1 }).lean(),
+  ]);
+  return {
+    api: [...api.map(toSample), ...pendingApi.filter((s) => s.t >= since)],
+    web: [...web.map(toSample), ...pendingWeb.filter((s) => s.t >= since)],
+  };
+}
+
+function percentile(sorted: number[], p: number) {
+  if (!sorted.length) return 0;
+  const idx = Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1);
+  return sorted[Math.max(0, idx)];
+}
+
+function summarize(values: number[]) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const avg = sorted.length ? sorted.reduce((s, v) => s + v, 0) / sorted.length : 0;
+  return {
+    count: sorted.length,
+    avg: +avg.toFixed(1),
+    p50: +percentile(sorted, 50).toFixed(1),
+    p95: +percentile(sorted, 95).toFixed(1),
+    p99: +percentile(sorted, 99).toFixed(1),
+    max: +(sorted[sorted.length - 1] ?? 0).toFixed(1),
+  };
+}
+
+// Paths excluded from API metrics so the dashboard's own polling doesn't skew them
+const METRICS_IGNORED = new Set(['/api/admin/metrics', '/api/metrics/web']);
+
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api') || req.method === 'OPTIONS' || METRICS_IGNORED.has(req.path)) return next();
+  const start = process.hrtime.bigint();
+  res.on('finish', () => {
+    const ms = Number(process.hrtime.bigint() - start) / 1e6;
+    // Use the matched route pattern (e.g. /api/dentists/:id) so ids don't explode the endpoint list
+    const route = req.route?.path ? `${req.baseUrl}${req.route.path}` : '(unmatched)';
+    pushCapped(pendingApi, { t: Date.now(), method: req.method, route, status: res.statusCode, ms: +ms.toFixed(1) }, MAX_PENDING);
+  });
+  next();
+});
+
+// Browser-side timings (page loads, route navigations, client-observed API round-trips)
+app.post('/api/metrics/web', (req, res) => {
+  const samples = Array.isArray(req.body?.samples) ? req.body.samples.slice(0, 100) : [];
+  const num = (v: any) => (typeof v === 'number' && isFinite(v) && v >= 0 && v < 600000 ? +v.toFixed(1) : undefined);
+  for (const s of samples) {
+    const ms = num(s?.ms);
+    if (ms === undefined || !['page_load', 'navigation', 'api'].includes(s?.kind)) continue;
+    pushCapped(pendingWeb, {
+      t: Date.now(), kind: s.kind, page: String(s.page ?? '').slice(0, 200), ms,
+      ttfb: num(s.ttfb), fcp: num(s.fcp), dcl: num(s.dcl),
+      status: typeof s.status === 'number' ? s.status : undefined,
+    }, MAX_PENDING);
+  }
+  res.json({ ok: true });
+});
 
 // ── AUTH ─────────────────────────────────────────────────────────────────────
 app.post('/api/auth/register', async (req, res) => {
@@ -550,6 +672,152 @@ app.delete('/api/admin/doctors/:id', requireAuth, requireRole('admin'), async (r
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
+app.get('/api/admin/appointments', requireAuth, requireRole('admin'), async (_req, res) => {
+  try {
+    const appts = await Appointment.find()
+      .populate('child_id', 'name avatar_emoji')
+      .populate('dentist_id', 'name clinic_name city')
+      .populate('parent_id', 'full_name email')
+      .sort({ createdAt: -1 });
+    res.json(appts.map((a: any) => ({
+      ...fmtAppt(a),
+      parent_id: a.parent_id?._id?.toString() ?? a.parent_id?.toString(),
+      parent: a.parent_id?._id ? { full_name: a.parent_id.full_name, email: a.parent_id.email } : null,
+    })));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/admin/appointments/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  const { status } = req.body ?? {};
+  if (!['pending', 'confirmed', 'cancelled', 'completed'].includes(status)) {
+    res.status(400).json({ error: 'Invalid status' }); return;
+  }
+  try {
+    const appt = await Appointment.findByIdAndUpdate(req.params.id, { status }, { new: true });
+    if (!appt) { res.status(404).json({ error: 'Appointment not found' }); return; }
+    res.json({ id: appt._id.toString(), status: appt.status });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/admin/children', requireAuth, requireRole('admin'), async (_req, res) => {
+  try {
+    const [children, counts] = await Promise.all([
+      Child.find().populate('parent_id', 'full_name email').sort({ createdAt: -1 }),
+      Appointment.aggregate([{ $group: { _id: '$child_id', n: { $sum: 1 } } }]),
+    ]);
+    const countMap = new Map(counts.map((c: any) => [c._id?.toString(), c.n]));
+    res.json(children.map((c: any) => ({
+      id: c._id.toString(),
+      name: c.name, date_of_birth: c.date_of_birth, avatar_emoji: c.avatar_emoji,
+      created_at: c.createdAt,
+      parent_id: c.parent_id?._id?.toString() ?? c.parent_id?.toString(),
+      parent: c.parent_id?._id ? { full_name: c.parent_id.full_name, email: c.parent_id.email } : null,
+      appointment_count: countMap.get(c._id.toString()) ?? 0,
+    })));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/admin/metrics', requireAuth, requireRole('admin'), async (req, res) => {
+  const windowMin = Math.min(7 * 1440, Math.max(1, Number(req.query.window) || 5));
+  const now = Date.now();
+  const since = now - windowMin * 60_000;
+
+  // DB round-trip
+  let dbPingMs: number | null = null;
+  try {
+    const t0 = process.hrtime.bigint();
+    await mongoose.connection.db?.admin().ping();
+    dbPingMs = +(Number(process.hrtime.bigint() - t0) / 1e6).toFixed(1);
+  } catch { /* leave null */ }
+
+  let recentApi: ApiSample[], recentWeb: WebSample[], storedRequests: number;
+  try {
+    ({ api: recentApi, web: recentWeb } = await loadSamples(since));
+    storedRequests = (await ApiMetric.estimatedDocumentCount()) + pendingApi.length;
+  } catch (err: any) { res.status(500).json({ error: err.message }); return; }
+
+  // Per-endpoint table
+  const byRoute = new Map<string, ApiSample[]>();
+  for (const s of recentApi) {
+    const key = `${s.method} ${s.route}`;
+    (byRoute.get(key) ?? byRoute.set(key, []).get(key)!).push(s);
+  }
+  const endpoints = [...byRoute.entries()].map(([key, list]) => ({
+    endpoint: key,
+    ...summarize(list.map((s) => s.ms)),
+    errors: list.filter((s) => s.status >= 400).length,
+    last_ms: +list[list.length - 1].ms.toFixed(1),
+  })).sort((a, b) => b.p95 - a.p95);
+
+  // Time series; bucket size grows with the window to keep ~30-100 points
+  const bucketMs = windowMin <= 10 ? 10_000 : windowMin <= 60 ? 60_000 : windowMin <= 1440 ? 15 * 60_000 : 2 * 3600_000;
+  const firstBucket = Math.floor(since / bucketMs) * bucketMs;
+  const apiBuckets = new Map<number, number[]>();
+  const webBuckets = new Map<number, number[]>();
+  const bucketOf = (t: number) => Math.floor(t / bucketMs) * bucketMs;
+  for (const s of recentApi) (apiBuckets.get(bucketOf(s.t)) ?? apiBuckets.set(bucketOf(s.t), []).get(bucketOf(s.t))!).push(s.ms);
+  for (const s of recentWeb) if (s.kind !== 'api') (webBuckets.get(bucketOf(s.t)) ?? webBuckets.set(bucketOf(s.t), []).get(bucketOf(s.t))!).push(s.ms);
+  const series: { t: number; avg: number | null; p95: number | null; requests: number; page_ms: number | null }[] = [];
+  for (let b = firstBucket; b <= now; b += bucketMs) {
+    const inB = apiBuckets.get(b) ?? [];
+    const webB = webBuckets.get(b) ?? [];
+    const sum = summarize(inB);
+    series.push({
+      t: b,
+      avg: inB.length ? sum.avg : null,
+      p95: inB.length ? sum.p95 : null,
+      requests: inB.length,
+      page_ms: webB.length ? summarize(webB).avg : null,
+    });
+  }
+
+  // Webpage timings grouped by page
+  const pageGroups = new Map<string, WebSample[]>();
+  for (const s of recentWeb.filter((w) => w.kind !== 'api')) {
+    const key = `${s.kind}|${s.page}`;
+    (pageGroups.get(key) ?? pageGroups.set(key, []).get(key)!).push(s);
+  }
+  const avgOf = (vals: (number | undefined)[]) => {
+    const v = vals.filter((x): x is number => x !== undefined);
+    return v.length ? +(v.reduce((a, b) => a + b, 0) / v.length).toFixed(1) : null;
+  };
+  const pages = [...pageGroups.entries()].map(([key, list]) => {
+    const [kind, page] = key.split('|');
+    return {
+      kind, page, ...summarize(list.map((s) => s.ms)),
+      ttfb: avgOf(list.map((s) => s.ttfb)), fcp: avgOf(list.map((s) => s.fcp)), dcl: avgOf(list.map((s) => s.dcl)),
+    };
+  }).sort((a, b) => b.avg - a.avg);
+
+  const apiAll = summarize(recentApi.map((s) => s.ms));
+  const pageLoads = recentWeb.filter((s) => s.kind === 'page_load');
+  const navs = recentWeb.filter((s) => s.kind === 'navigation');
+  const clientApi = recentWeb.filter((s) => s.kind === 'api');
+
+  res.json({
+    generated_at: now,
+    window_min: windowMin,
+    uptime_s: Math.round((now - serverStartedAt) / 1000),
+    total_requests: storedRequests,
+    retention_days: METRICS_RETENTION_DAYS,
+    db_ping_ms: dbPingMs,
+    api: {
+      ...apiAll,
+      errors: recentApi.filter((s) => s.status >= 400).length,
+      rpm: +(recentApi.length / windowMin).toFixed(1),
+    },
+    web: {
+      page_load: { ...summarize(pageLoads.map((s) => s.ms)), ttfb: avgOf(pageLoads.map((s) => s.ttfb)), fcp: avgOf(pageLoads.map((s) => s.fcp)) },
+      navigation: summarize(navs.map((s) => s.ms)),
+      client_api: summarize(clientApi.map((s) => s.ms)),
+    },
+    series,
+    endpoints,
+    pages,
+    recent: recentApi.slice(-25).reverse().map((s) => ({ ...s, ms: +s.ms.toFixed(1) })),
+  });
+});
+
 // ── DOCTOR ────────────────────────────────────────────────────────────────────
 app.get('/api/doctor/profile', requireAuth, requireRole('doctor'), async (req, res) => {
   try {
@@ -709,6 +977,142 @@ app.post('/api/chat', async (req, res) => {
       error: `Could not reach Ollama model (${model}). Ensure Ollama is running on ${ollamaHost}. Error: ${err.message}`,
     });
   }
+});
+
+// ── TEETH PHOTO CHECK ─────────────────────────────────────────────────────────
+// Photo → "Good/Bad Teeth" image classifier (steven123/Check_GoodBad_Teeth, converted to 8-bit ONNX
+// by scripts/convert_teeth_model.py and committed under server/models/) + parent-reported red-flag symptoms → normal / abnormal / emergency.
+// Photos are analysed in memory and never stored.
+
+const TeethCheckSchema = new mongoose.Schema(
+  {
+    parent_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    child_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Child', default: null },
+    category: { type: String, enum: ['normal', 'abnormal', 'emergency'], required: true },
+    model_label: { type: String, default: null },
+    model_confidence: { type: Number, default: null },
+    low_confidence: { type: Boolean, default: false },
+    symptoms: { type: [String], default: [] },
+    reasons: { type: [String], default: [] },
+    inference_ms: { type: Number, default: null },
+  },
+  { timestamps: true }
+);
+const TeethCheck = (mongoose.models['TeethCheck'] as mongoose.Model<any>) || mongoose.model('TeethCheck', TeethCheckSchema);
+
+// Symptoms are decided by rules, not the model: a photo cannot show swelling, fever or an injury's severity
+const SYMPTOMS: Record<string, { label: string; level: 'emergency' | 'abnormal' }> = {
+  swelling:    { label: 'Swelling of the face, cheek or gums', level: 'emergency' },
+  injury:      { label: 'Tooth knocked out, broken or pushed in after a fall or hit', level: 'emergency' },
+  bleeding:    { label: "Bleeding that won't stop after 10 minutes of pressure", level: 'emergency' },
+  fever:       { label: 'Fever together with tooth or mouth pain', level: 'emergency' },
+  severe_pain: { label: "Pain that keeps the child awake or isn't helped by painkillers", level: 'abnormal' },
+  pain:        { label: 'Toothache or sensitivity to hot, cold or sweet', level: 'abnormal' },
+  sores:       { label: 'Mouth sores or ulcers lasting more than 2 weeks', level: 'abnormal' },
+};
+
+// Below this the model is close to a coin-flip, so the parent is asked for a clearer photo
+const TEETH_LOW_CONFIDENCE = 0.65;
+
+let teethClassifier: Promise<any> | null = null;
+function getTeethClassifier() {
+  if (!teethClassifier) {
+    teethClassifier = (async () => {
+      const { pipeline, env } = await import('@huggingface/transformers');
+      env.allowRemoteModels = false;
+      env.localModelPath = new URL('./models/', import.meta.url).pathname;
+      // 8-bit weights (onnx/model_quantized.onnx), committed to the repo
+      return pipeline('image-classification', 'teeth-goodbad', { dtype: 'q8' });
+    })().catch((err) => { teethClassifier = null; throw err; });
+  }
+  return teethClassifier;
+}
+
+async function classifyTeeth(image: Buffer) {
+  const { RawImage } = await import('@huggingface/transformers');
+  const classifier = await getTeethClassifier();
+  const raw = await RawImage.fromBlob(new Blob([new Uint8Array(image)]));
+  const out: { label: string; score: number }[] = await classifier(raw, { top_k: 2 });
+  const bad = out.find((o) => o.label === 'Bad Teeth')?.score ?? 0;
+  return { bad, good: 1 - bad, label: bad >= 0.5 ? 'Bad Teeth' : 'Good Teeth' };
+}
+
+app.get('/api/teeth-check/symptoms', (_req, res) => {
+  res.json(Object.entries(SYMPTOMS).map(([id, s]) => ({ id, ...s })));
+});
+
+app.post(TEETH_CHECK_PATH, requireAuth, async (req, res) => {
+  const { image, child_id, symptoms: rawSymptoms } = req.body ?? {};
+  const match = typeof image === 'string' && image.match(/^data:image\/(jpeg|png|webp);base64,(.+)$/);
+  if (!match) { res.status(400).json({ error: 'A JPEG, PNG or WebP photo is required' }); return; }
+  const symptoms = (Array.isArray(rawSymptoms) ? rawSymptoms : []).filter((s: any) => typeof s === 'string' && SYMPTOMS[s]);
+
+  if (child_id) {
+    const child = await Child.findOne({ _id: child_id, parent_id: (req as any).userId }).catch(() => null);
+    if (!child) { res.status(404).json({ error: 'Child not found' }); return; }
+  }
+
+  let prediction: Awaited<ReturnType<typeof classifyTeeth>>;
+  const t0 = process.hrtime.bigint();
+  try {
+    prediction = await classifyTeeth(Buffer.from(match[2], 'base64'));
+  } catch (err: any) {
+    console.error('Teeth model error:', err.message);
+    const missing = /could not locate|not found|no such file/i.test(err.message);
+    res.status(503).json({
+      error: missing
+        ? 'The teeth-check model is not installed on the server. Run scripts/convert_teeth_model.py.'
+        : 'Could not analyse this photo. Please try a different photo.',
+    });
+    return;
+  }
+  const inferenceMs = +(Number(process.hrtime.bigint() - t0) / 1e6).toFixed(1);
+
+  const confidence = Math.max(prediction.bad, prediction.good);
+  const lowConfidence = confidence < TEETH_LOW_CONFIDENCE;
+  const emergencySymptoms = symptoms.filter((s: string) => SYMPTOMS[s].level === 'emergency');
+  const abnormalSymptoms = symptoms.filter((s: string) => SYMPTOMS[s].level === 'abnormal');
+
+  const reasons: string[] = [];
+  let category: 'normal' | 'abnormal' | 'emergency';
+  if (emergencySymptoms.length) {
+    category = 'emergency';
+    reasons.push(...emergencySymptoms.map((s: string) => SYMPTOMS[s].label));
+  } else if ((prediction.label === 'Bad Teeth' && !lowConfidence) || abnormalSymptoms.length) {
+    category = 'abnormal';
+    if (prediction.label === 'Bad Teeth' && !lowConfidence) reasons.push('The photo shows possible signs of tooth or gum problems');
+    reasons.push(...abnormalSymptoms.map((s: string) => SYMPTOMS[s].label));
+  } else {
+    category = 'normal';
+    reasons.push(lowConfidence ? 'The photo was unclear, and no warning symptoms were reported' : 'No visible problems were detected in the photo, and no warning symptoms were reported');
+  }
+
+  try {
+    const saved = await TeethCheck.create({
+      parent_id: (req as any).userId, child_id: child_id || null, category,
+      model_label: prediction.label, model_confidence: +confidence.toFixed(4), low_confidence: lowConfidence,
+      symptoms, reasons, inference_ms: inferenceMs,
+    });
+    res.json({
+      id: saved._id.toString(), category, reasons, low_confidence: lowConfidence,
+      model: { label: prediction.label, confidence: +confidence.toFixed(3), scores: { bad: +prediction.bad.toFixed(3), good: +prediction.good.toFixed(3) } },
+      inference_ms: inferenceMs,
+      created_at: saved.createdAt,
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/teeth-checks', requireAuth, async (req, res) => {
+  try {
+    const checks = await TeethCheck.find({ parent_id: (req as any).userId })
+      .populate('child_id', 'name avatar_emoji').sort({ createdAt: -1 }).limit(50);
+    res.json(checks.map((c: any) => ({
+      id: c._id.toString(), category: c.category, reasons: c.reasons, symptoms: c.symptoms,
+      low_confidence: c.low_confidence, model_label: c.model_label, model_confidence: c.model_confidence,
+      child: c.child_id?._id ? { id: c.child_id._id.toString(), name: c.child_id.name, avatar_emoji: c.child_id.avatar_emoji } : null,
+      created_at: c.createdAt,
+    })));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // ── SEED ──────────────────────────────────────────────────────────────────────

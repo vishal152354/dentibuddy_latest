@@ -10,7 +10,11 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { toast } from "sonner";
-import { Plus, Pencil, Trash2, Star, MapPin, Phone, BadgeCheck, KeyRound, Mail, UserCheck } from "lucide-react";
+import { Plus, Pencil, Trash2, Star, MapPin, Phone, BadgeCheck, KeyRound, Mail, UserCheck, Stethoscope, CalendarCheck, Baby, Gauge } from "lucide-react";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { BookingsPanel, useAdminBookings } from "@/components/admin/bookings-panel";
+import { ChildrenPanel, useAdminChildren } from "@/components/admin/children-panel";
+import { PerformancePanel } from "@/components/admin/performance-panel";
 
 export const Route = createFileRoute("/admin")({
   component: AdminPage,
@@ -48,6 +52,10 @@ function AdminPage() {
   const [editing, setEditing] = useState<Doctor | null>(null);
   const [form, setForm] = useState(EMPTY_FORM);
   const [deleteTarget, setDeleteTarget] = useState<Doctor | null>(null);
+  const [tab, setTab] = useState('doctors');
+  const isAdmin = user?.role === 'admin';
+  const { data: bookings = [] } = useAdminBookings(isAdmin);
+  const { data: children = [] } = useAdminChildren(isAdmin);
 
   useEffect(() => {
     if (user && user.role !== 'admin') navigate({ to: '/home' });
@@ -124,14 +132,29 @@ function AdminPage() {
       <div className="max-w-screen-xl mx-auto px-5 pb-6 lg:px-6 lg:py-8">
         <PageHeader
           title="Admin Panel"
-          subtitle="Add and manage doctor accounts"
-          right={
+          subtitle="Doctors, bookings, children and live performance"
+          right={tab === 'doctors' ? (
             <Button onClick={openAdd} className="rounded-2xl gap-2">
               <Plus className="h-4 w-4" /> Add Doctor
             </Button>
-          }
+          ) : undefined}
         />
 
+        <Tabs value={tab} onValueChange={setTab}>
+          <div className="overflow-x-auto -mx-5 px-5 lg:mx-0 lg:px-0 mb-4">
+            <TabsList className="h-10 rounded-xl">
+              <TabsTrigger value="doctors" className="rounded-lg gap-1.5 px-3"><Stethoscope className="h-3.5 w-3.5" /> Doctors <Count n={doctors.length} /></TabsTrigger>
+              <TabsTrigger value="bookings" className="rounded-lg gap-1.5 px-3"><CalendarCheck className="h-3.5 w-3.5" /> Bookings <Count n={bookings.length} /></TabsTrigger>
+              <TabsTrigger value="children" className="rounded-lg gap-1.5 px-3"><Baby className="h-3.5 w-3.5" /> Children <Count n={children.length} /></TabsTrigger>
+              <TabsTrigger value="performance" className="rounded-lg gap-1.5 px-3"><Gauge className="h-3.5 w-3.5" /> Performance</TabsTrigger>
+            </TabsList>
+          </div>
+
+          <TabsContent value="bookings"><BookingsPanel enabled={isAdmin} /></TabsContent>
+          <TabsContent value="children"><ChildrenPanel enabled={isAdmin} /></TabsContent>
+          <TabsContent value="performance"><PerformancePanel enabled={isAdmin && tab === 'performance'} /></TabsContent>
+
+          <TabsContent value="doctors">
         {isLoading ? (
           <p className="text-center text-muted-foreground py-16">Loading…</p>
         ) : doctors.length === 0 ? (
@@ -194,6 +217,8 @@ function AdminPage() {
             ))}
           </div>
         )}
+          </TabsContent>
+        </Tabs>
       </div>
 
       {/* Add / Edit Dialog */}
@@ -315,6 +340,10 @@ function AdminPage() {
       </Dialog>
     </MobileShell>
   );
+}
+
+function Count({ n }: { n: number }) {
+  return <span className="text-[10px] font-bold rounded-full bg-primary/10 text-primary px-1.5 py-0.5 tabular-nums">{n}</span>;
 }
 
 function Field({

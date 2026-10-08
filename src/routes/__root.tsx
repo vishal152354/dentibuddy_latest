@@ -11,6 +11,8 @@ import {
 import appCss from "../styles.css?url";
 import { AuthProvider } from "@/context/auth-context";
 import { Toaster } from "@/components/ui/sonner";
+import { useEffect } from "react";
+import { startPerfReporting, recordSample, normalizePath } from "@/lib/perf";
 
 function NotFoundComponent() {
   return (
@@ -123,6 +125,22 @@ function RootShell({ children }: { children: React.ReactNode }) {
 
 function RootComponent() {
   const { queryClient } = Route.useRouteContext();
+  const router = useRouter();
+
+  // Measure in-app route changes: navigation start -> new route rendered
+  useEffect(() => {
+    startPerfReporting();
+    let navStart: number | null = null;
+    const offStart = router.subscribe("onBeforeNavigate", (e) => {
+      navStart = e.pathChanged ? performance.now() : null;
+    });
+    const offEnd = router.subscribe("onRendered", (e) => {
+      if (navStart === null) return;
+      recordSample({ kind: "navigation", page: normalizePath(e.toLocation.pathname), ms: performance.now() - navStart });
+      navStart = null;
+    });
+    return () => { offStart(); offEnd(); };
+  }, [router]);
 
   return (
     <QueryClientProvider client={queryClient}>

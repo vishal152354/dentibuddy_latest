@@ -1,5 +1,5 @@
 import { Link, useLocation, useNavigate } from "@tanstack/react-router";
-import { Home, Calendar, MessageCircle, Siren, User, Stethoscope, Lightbulb, ShieldCheck, ClipboardList, History } from "lucide-react";
+import { Home, Calendar, MessageCircle, Siren, User, Stethoscope, Lightbulb, ShieldCheck, ClipboardList, History, ScanFace } from "lucide-react";
 import { ReactNode, useEffect } from "react";
 import { useAuth } from "@/context/auth-context";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -17,6 +17,7 @@ const patientDesktopNav = [
   { to: "/dentists", label: "Dentists", icon: Stethoscope },
   { to: "/appointments", label: "Visits", icon: Calendar },
   { to: "/history", label: "History", icon: History },
+  { to: "/teeth-check", label: "Teeth Check", icon: ScanFace },
   { to: "/chatbot", label: "Buddy AI", icon: MessageCircle },
   { to: "/emergency", label: "Emergency", icon: Siren },
   { to: "/tips", label: "Tips", icon: Lightbulb },

@@ -1,3 +1,5 @@
+import { recordSample, normalizePath } from "@/lib/perf";
+
 export function getApiBaseUrl(): string {
   if (typeof window !== 'undefined') {
     const custom = localStorage.getItem('denti_api_url');
@@ -49,10 +51,18 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const base = getApiBaseUrl();
   const targetUrl = `${base}${path.startsWith('/') ? path : `/${path}`}`;
 
-  const res = await fetch(targetUrl, {
-    ...options,
-    headers: { ...headers, ...((options?.headers ?? {}) as Record<string, string>) },
-  });
+  const started = performance.now();
+  let res: Response;
+  try {
+    res = await fetch(targetUrl, {
+      ...options,
+      headers: { ...headers, ...((options?.headers ?? {}) as Record<string, string>) },
+    });
+  } catch (err) {
+    recordApiTiming(path, options?.method, started, 0);
+    throw err;
+  }
+  recordApiTiming(path, options?.method, started, res.status);
 
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
@@ -60,6 +70,17 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   }
 
   return res.json() as Promise<T>;
+}
+
+// Admin metrics polling is excluded so the dashboard doesn't measure itself
+function recordApiTiming(path: string, method: string | undefined, started: number, status: number) {
+  if (path.startsWith('/admin/metrics')) return;
+  recordSample({
+    kind: 'api',
+    page: `${method ?? 'GET'} ${normalizePath(path)}`,
+    ms: performance.now() - started,
+    status,
+  });
 }
 
 export const api = {

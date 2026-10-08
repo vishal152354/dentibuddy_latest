@@ -5,7 +5,7 @@ import { useAuth } from "@/context/auth-context";
 import { MobileShell } from "@/components/mobile-shell";
 import { useTheme } from "@/components/theme-toggle";
 import { api } from "@/lib/api";
-import { Calendar, MessageCircle, Siren, Stethoscope, Lightbulb, Plus, ChevronRight, Star } from "lucide-react";
+import { Calendar, MessageCircle, Siren, Stethoscope, Lightbulb, Plus, ChevronRight, Star, ScanFace } from "lucide-react";
 
 export const Route = createFileRoute("/home")({
   component: HomePage,
@@ -102,6 +102,14 @@ function HomePage() {
               <Quick to="/chatbot" icon={<MessageCircle className="h-5 w-5" />} label="Buddy AI" tone="bg-mint text-mint-foreground" />
               <Quick to="/emergency" icon={<Siren className="h-5 w-5" />} label="Emergency" tone="bg-coral text-coral-foreground" />
               <Quick to="/tips" icon={<Lightbulb className="h-5 w-5" />} label="Tips" tone="bg-sunshine text-sunshine-foreground" />
+              <Link to="/teeth-check" className="col-span-4 lg:col-span-2 flex items-center gap-3 rounded-2xl bg-card border border-border p-3 shadow-[var(--shadow-card)] hover:border-primary transition-colors">
+                <span className="h-10 w-10 rounded-xl bg-primary/10 text-primary flex items-center justify-center shrink-0"><ScanFace className="h-5 w-5" /></span>
+                <span className="min-w-0">
+                  <span className="block text-sm font-semibold">Teeth Check</span>
+                  <span className="block text-xs text-muted-foreground truncate">Snap a photo to see if a dentist visit is needed</span>
+                </span>
+                <ChevronRight className="h-4 w-4 text-muted-foreground ml-auto shrink-0" />
+              </Link>
             </div>
           </div>
         </div>

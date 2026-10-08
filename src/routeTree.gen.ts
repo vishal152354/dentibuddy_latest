@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as TipsRouteImport } from './routes/tips'
+import { Route as TeethCheckRouteImport } from './routes/teeth-check'
 import { Route as ProfileRouteImport } from './routes/profile'
 import { Route as HomeRouteImport } from './routes/home'
 import { Route as HistoryRouteImport } from './routes/history'
@@ -29,6 +30,11 @@ import { Route as BookDentistIdRouteImport } from './routes/book.$dentistId'
 const TipsRoute = TipsRouteImport.update({
   id: '/tips',
   path: '/tips',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TeethCheckRoute = TeethCheckRouteImport.update({
+  id: '/teeth-check',
+  path: '/teeth-check',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ProfileRoute = ProfileRouteImport.update({
@@ -119,6 +125,7 @@ export interface FileRoutesByFullPath {
   '/history': typeof HistoryRoute
   '/home': typeof HomeRoute
   '/profile': typeof ProfileRoute
+  '/teeth-check': typeof TeethCheckRoute
   '/tips': typeof TipsRoute
   '/book/$dentistId': typeof BookDentistIdRoute
   '/dentists/$id': typeof DentistsIdRoute
@@ -137,6 +144,7 @@ export interface FileRoutesByTo {
   '/history': typeof HistoryRoute
   '/home': typeof HomeRoute
   '/profile': typeof ProfileRoute
+  '/teeth-check': typeof TeethCheckRoute
   '/tips': typeof TipsRoute
   '/book/$dentistId': typeof BookDentistIdRoute
   '/dentists/$id': typeof DentistsIdRoute
@@ -156,6 +164,7 @@ export interface FileRoutesById {
   '/history': typeof HistoryRoute
   '/home': typeof HomeRoute
   '/profile': typeof ProfileRoute
+  '/teeth-check': typeof TeethCheckRoute
   '/tips': typeof TipsRoute
   '/book/$dentistId': typeof BookDentistIdRoute
   '/dentists/$id': typeof DentistsIdRoute
@@ -176,6 +185,7 @@ export interface FileRouteTypes {
     | '/history'
     | '/home'
     | '/profile'
+    | '/teeth-check'
     | '/tips'
     | '/book/$dentistId'
     | '/dentists/$id'
@@ -194,6 +204,7 @@ export interface FileRouteTypes {
     | '/history'
     | '/home'
     | '/profile'
+    | '/teeth-check'
     | '/tips'
     | '/book/$dentistId'
     | '/dentists/$id'
@@ -212,6 +223,7 @@ export interface FileRouteTypes {
     | '/history'
     | '/home'
     | '/profile'
+    | '/teeth-check'
     | '/tips'
     | '/book/$dentistId'
     | '/dentists/$id'
@@ -231,6 +243,7 @@ export interface RootRouteChildren {
   HistoryRoute: typeof HistoryRoute
   HomeRoute: typeof HomeRoute
   ProfileRoute: typeof ProfileRoute
+  TeethCheckRoute: typeof TeethCheckRoute
   TipsRoute: typeof TipsRoute
   BookDentistIdRoute: typeof BookDentistIdRoute
   DentistsIdRoute: typeof DentistsIdRoute
@@ -245,6 +258,13 @@ declare module '@tanstack/react-router' {
       path: '/tips'
       fullPath: '/tips'
       preLoaderRoute: typeof TipsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/teeth-check': {
+      id: '/teeth-check'
+      path: '/teeth-check'
+      fullPath: '/teeth-check'
+      preLoaderRoute: typeof TeethCheckRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/profile': {
@@ -367,6 +387,7 @@ const rootRouteChildren: RootRouteChildren = {
   HistoryRoute: HistoryRoute,
   HomeRoute: HomeRoute,
   ProfileRoute: ProfileRoute,
+  TeethCheckRoute: TeethCheckRoute,
   TipsRoute: TipsRoute,
   BookDentistIdRoute: BookDentistIdRoute,
   DentistsIdRoute: DentistsIdRoute,
